@@ -14,7 +14,7 @@ while True:
         print("exit")
         break
 
-    color = cv.cvtColor(frame, cv.COLOR_BGRA2RGBA)
+    color = cv.cvtColor(frame, cv.COLOR_BGR2BGRA)
     cv.imshow("CUSTOM CAMERA", color)
     if cv.waitKey(1) == ord("q") or cv.waitKey(1) == ord("Q"):
         break
