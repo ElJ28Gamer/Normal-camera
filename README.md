@@ -3,4 +3,3 @@
 - To exit hold "q" or "Q"
 # Dependences
 - opencv-python
-- numpy
