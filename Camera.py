@@ -11,7 +11,7 @@ custom_color = cv.COLOR_BGR2BGRA
 while True:
     ret, frame = cap.read()
 
-if cv.waitKey(1) == ord("n") or cv.waitKey(1) == ord("N"):
+    if cv.waitKey(1) == ord("n") or cv.waitKey(1) == ord("N"):
         custom_color = cv.COLOR_BGR2BGRA
     
     if cv.waitKey(1) == ord("o") or cv.waitKey(1) == ord("O"):
