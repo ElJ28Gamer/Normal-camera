@@ -1,7 +1,7 @@
 import cv2 as cv
 import random as r
 
-delay = 1
+delay = 5
 random = 0
 random_stop = True
 custom_color = cv.COLOR_BGR2BGRA
