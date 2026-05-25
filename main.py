@@ -6,6 +6,12 @@ from mediapipe import Image as MediapipeImage, ImageFormat
 import time
 import numpy as np
 import os
+import json
+import pickle
+import threading
+import urllib.request
+from pathlib import Path
+from collections import deque
 
 # Try to download the hand landmarker model if it doesn't exist
 model_path = 'hand_landmarker.task'
@@ -35,6 +41,14 @@ except Exception as e:
     print(f"Error initializing detector: {e}")
     print("Hand detection will be disabled")
 
+# Initialize face detection using OpenCV cascade classifiers
+face_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_frontalface_default.xml')
+eye_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_eye.xml')
+
+# Create image cache directory
+image_cache_dir = Path("image_cache")
+image_cache_dir.mkdir(exist_ok=True)
+
 # FPS counter variables
 pTime = 0
 cTime = 0
@@ -52,6 +66,21 @@ gesture_history = []
 stable_gesture = -1
 gesture_stability_frames = 5  # Require 5 consistent frames for stable gesture
 
+# Initialize face detection components
+expression_detector = ExpressionDetector(stability_frames=5)
+face_database = FaceDatabase("face_database.pkl")
+image_manager = ImageWindowManager("image_cache", timeout=5)
+
+# Load expression-to-URL config
+face_config = {}
+if os.path.exists("face_config.json"):
+    with open("face_config.json", "r") as f:
+        face_config = json.load(f)
+
+# Detection mode variables
+detection_mode = "hand"  # hand, face, or both
+detected_faces = {}  # Store detected face info per frame
+
 cap = cv.VideoCapture(0)
 
 if not cap.isOpened():
@@ -59,7 +88,8 @@ if not cap.isOpened():
     exit()
 
 print("Camera initialized. Press 'q' to quit.")
-print("Move your hand in front of the camera to test hand detection.")
+print("Detection modes: 'H'=hand, 'F'=face, 'B'=both, 'M'=toggle")
+print("Move your hand in front of the camera to test detection.")
 
 def get_finger_state(hand_landmarks, debug=False):
     """
@@ -269,6 +299,227 @@ def apply_distortion(frame, distortion_type):
     else:
         return frame
 
+class ExpressionDetector:
+    """Detects facial expressions using simple image-based heuristics"""
+    
+    def __init__(self, stability_frames=5):
+        self.stability_frames = stability_frames
+        self.expression_history = {
+            'smile': deque(maxlen=stability_frames),
+            'blink': deque(maxlen=stability_frames),
+            'mouth_open': deque(maxlen=stability_frames),
+            'eyebrows_raised': deque(maxlen=stability_frames)
+        }
+    
+    def detect_expressions(self, frame, face_roi, eyes):
+        """Detect expressions from face region"""
+        if frame is None or face_roi is None:
+            return {}
+        
+        x, y, w, h = face_roi
+        face_img = frame[y:y+h, x:x+w]
+        
+        if face_img.size == 0:
+            return {}
+        
+        # Convert to grayscale for analysis
+        gray_face = cv.cvtColor(face_img, cv.COLOR_BGR2GRAY)
+        
+        # Simple heuristics (can be improved)
+        smile = self._detect_smile(gray_face)
+        blink = self._detect_blink(eyes)
+        mouth_open = self._detect_mouth_open(gray_face)
+        eyebrows_raised = self._detect_eyebrows(gray_face)
+        
+        return {
+            'smile': smile,
+            'blink': blink,
+            'mouth_open': mouth_open,
+            'eyebrows_raised': eyebrows_raised
+        }
+    
+    def _detect_smile(self, gray_face):
+        """Detect smile by analyzing mouth area"""
+        # Lower half of face where mouth is
+        h = gray_face.shape[0]
+        mouth_region = gray_face[int(h * 0.6):, :]
+        
+        # Check for bright mouth area (smile indicator)
+        mean_brightness = np.mean(mouth_region)
+        return mean_brightness > 120
+    
+    def _detect_blink(self, eyes):
+        """Detect blink when eyes are closed"""
+        if not eyes:
+            return True
+        
+        # If no eyes detected in region, likely blinking/eyes closed
+        return len(eyes) < 2
+    
+    def _detect_mouth_open(self, gray_face):
+        """Detect open mouth"""
+        # Lower region of face
+        h = gray_face.shape[0]
+        mouth_region = gray_face[int(h * 0.7):, :]
+        
+        if mouth_region.size == 0:
+            return False
+        
+        # Detect dark pixels (inside mouth)
+        dark_pixels = np.sum(mouth_region < 100)
+        total_pixels = mouth_region.size
+        
+        return (dark_pixels / total_pixels) > 0.15
+    
+    def _detect_eyebrows(self, gray_face):
+        """Detect raised eyebrows"""
+        # Upper region of face
+        eyebrow_region = gray_face[:int(gray_face.shape[0] * 0.3), :]
+        
+        if eyebrow_region.size == 0:
+            return False
+        
+        # Raised eyebrows show more forehead area
+        dark_pixels = np.sum(eyebrow_region < 100)
+        return dark_pixels > eyebrow_region.size * 0.2
+    
+    def is_expression_stable(self, expression_dict):
+        """Check if expression is stable (consistent over N frames)"""
+        stable_expressions = {}
+        for expr_name, detected in expression_dict.items():
+            self.expression_history[expr_name].append(detected)
+            if len(self.expression_history[expr_name]) == self.stability_frames:
+                if all(self.expression_history[expr_name]):
+                    stable_expressions[expr_name] = True
+        return stable_expressions
+
+class FaceDatabase:
+    """Manages face recognition and person identification"""
+    
+    def __init__(self, db_path="face_database.pkl"):
+        self.db_path = db_path
+        self.faces = {}
+        self.load_database()
+    
+    def load_database(self):
+        """Load face database from file"""
+        if os.path.exists(self.db_path):
+            with open(self.db_path, 'rb') as f:
+                self.faces = pickle.load(f)
+    
+    def save_database(self):
+        """Save face database to file"""
+        with open(self.db_path, 'wb') as f:
+            pickle.dump(self.faces, f)
+    
+    def add_face(self, person_id, person_name, face_roi):
+        """Add a face to the database (face_roi: [x, y, w, h])"""
+        if face_roi is None:
+            return False
+        
+        self.faces[person_id] = {
+            'name': person_name,
+            'roi': tuple(face_roi),
+            'created_at': time.time()
+        }
+        self.save_database()
+        return True
+    
+    def find_face(self, face_roi, threshold=50):
+        """Find matching face in database (simple distance comparison)"""
+        if face_roi is None or not self.faces:
+            return None
+        
+        x, y, w, h = face_roi
+        current_center = (x + w//2, y + h//2)
+        
+        min_distance = float('inf')
+        best_match = None
+        
+        for person_id, face_data in self.faces.items():
+            stored_roi = face_data['roi']
+            stored_x, stored_y, stored_w, stored_h = stored_roi
+            stored_center = (stored_x + stored_w//2, stored_y + stored_h//2)
+            
+            distance = np.sqrt((current_center[0] - stored_center[0])**2 + 
+                            (current_center[1] - stored_center[1])**2)
+            
+            if distance < min_distance:
+                min_distance = distance
+                best_match = person_id if distance < threshold else None
+        
+        return best_match
+
+class ImageWindowManager:
+    """Manages downloading and displaying images from URLs"""
+    
+    def __init__(self, cache_dir="image_cache", timeout=5):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
+        self.timeout = timeout
+        self.open_windows = {}
+        self.window_timers = {}
+    
+    def get_image_for_url(self, url):
+        """Download and cache image from URL"""
+        import hashlib
+        
+        if url is None:
+            return None
+        
+        url_hash = hashlib.md5(url.encode()).hexdigest()
+        cache_path = self.cache_dir / f"{url_hash}.jpg"
+        
+        # Return cached image if exists
+        if cache_path.exists():
+            return cv.imread(str(cache_path))
+        
+        # Download and cache
+        try:
+            urllib.request.urlretrieve(url, str(cache_path))
+            return cv.imread(str(cache_path))
+        except Exception as e:
+            print(f"Failed to download image from {url}: {e}")
+            return None
+    
+    def display_image_for_expression(self, person_id, expression_name, image_url):
+        """Display image in a window for a detected expression"""
+        if image_url is None:
+            return
+        
+        window_name = f"{person_id}_{expression_name}"
+        
+        # Get or download image
+        image = self.get_image_for_url(image_url)
+        if image is None:
+            return
+        
+        # Resize to reasonable size
+        h, w = image.shape[:2]
+        max_width, max_height = 400, 300
+        if w > max_width or h > max_height:
+            scale = min(max_width / w, max_height / h)
+            image = cv.resize(image, (int(w * scale), int(h * scale)))
+        
+        cv.imshow(window_name, image)
+        self.open_windows[window_name] = time.time()
+        self.window_timers[window_name] = time.time()
+    
+    def update_windows(self):
+        """Close windows that have exceeded timeout"""
+        current_time = time.time()
+        windows_to_close = []
+        
+        for window_name, start_time in self.window_timers.items():
+            if current_time - start_time > self.timeout:
+                windows_to_close.append(window_name)
+        
+        for window_name in windows_to_close:
+            cv.destroyWindow(window_name)
+            del self.window_timers[window_name]
+            if window_name in self.open_windows:
+                del self.open_windows[window_name]
+
 def update_stable_gesture(new_gesture, gesture_history, stable_gesture, stability_frames=5):
     """Update gesture only when stable across multiple frames"""
     # Add new gesture to history
@@ -327,6 +578,24 @@ while True:
 
     elif key == ord("c") or key == ord("C"):
         random_stop = False
+    
+    elif key == ord("h") or key == ord("H"):
+        detection_mode = "hand"
+        print("Mode: HAND DETECTION")
+    
+    elif key == ord("f") or key == ord("F"):
+        detection_mode = "face"
+        print("Mode: FACE DETECTION")
+    
+    elif key == ord("b") or key == ord("B"):
+        detection_mode = "both"
+        print("Mode: HAND + FACE DETECTION")
+    
+    elif key == ord("m") or key == ord("M"):
+        modes = ["hand", "face", "both"]
+        current_idx = modes.index(detection_mode)
+        detection_mode = modes[(current_idx + 1) % len(modes)]
+        print(f"Mode: {detection_mode.upper()}")
 
     elif key == ord("q") or key == ord("Q"):
         break
@@ -358,7 +627,7 @@ while True:
     hand_detected = False
     hand_landmarks_list = []
     
-    if detector:
+    if detector and (detection_mode == "hand" or detection_mode == "both"):
         try:
             # Convert frame to RGB and create MediaPipe image
             rgb_frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
@@ -402,6 +671,51 @@ while True:
         except Exception as e:
             if frame_count % 30 == 0:
                 print(f"Detection error: {e}")
+    
+    # Face detection (every frame)
+    detected_faces = {}
+    if face_cascade and (detection_mode == "face" or detection_mode == "both"):
+        try:
+            gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+            
+            for idx, (x, y, w, h) in enumerate(faces):
+                face_roi = (x, y, w, h)
+                
+                # Detect eyes in face region
+                roi_gray = gray[y:y+h, x:x+w]
+                eyes = eye_cascade.detectMultiScale(roi_gray)
+                
+                # Detect expressions
+                expressions = expression_detector.detect_expressions(frame, face_roi, eyes)
+                stable_expressions = expression_detector.is_expression_stable(expressions)
+                
+                # Try to identify person
+                person_id = face_database.find_face(face_roi)
+                if person_id is None:
+                    person_id = f"Unknown_{idx}"
+                
+                detected_faces[person_id] = {
+                    'roi': face_roi,
+                    'eyes': eyes,
+                    'expressions': expressions,
+                    'stable_expressions': stable_expressions
+                }
+                
+                # Check for triggered expressions and display images
+                config_key = str(person_id)
+                if config_key in face_config:
+                    person_config = face_config[config_key]
+                    for expr_name, detected in stable_expressions.items():
+                        if detected and expr_name in person_config:
+                            image_url = person_config[expr_name]
+                            image_manager.display_image_for_expression(person_id, expr_name, image_url)
+        except Exception as e:
+            if frame_count % 30 == 0:
+                print(f"Face detection error: {e}")
+    
+    # Update image window timeouts
+    image_manager.update_windows()
 
     default_color = distortion_type
     
@@ -412,14 +726,35 @@ while True:
         for hand_landmarks in hand_landmarks_list:
             color = draw_hand_landmarks(color, hand_landmarks)
     
+    # Draw face bounding boxes and detected expressions
+    if detected_faces:
+        for person_id, face_data in detected_faces.items():
+            x, y, w, h = face_data['roi']
+            
+            # Draw bounding box
+            cv.rectangle(color, (x, y), (x+w, y+h), (0, 255, 255), 2)
+            
+            # Draw person ID/name
+            cv.putText(color, str(person_id), (x, y - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            
+            # Draw detected expressions
+            expr_text = ", ".join([name for name, detected in face_data['stable_expressions'].items() if detected])
+            if expr_text:
+                cv.putText(color, f"Expr: {expr_text}", (x, y + h + 20), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    
     # Display FPS on frame
     fps_text = f"FPS: {int(fps)}"
     cv.putText(color, fps_text, (10, 30), cv.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
     
-    # Display current gesture
-    gesture_names = {-1: "No Hand", 0: "Fist", 1: "Thumb Up", 2: "Peace", 3: "Three", 4: "Four", 5: "Open Hand"}
-    gesture_text = f"Gesture: {gesture_names.get(stable_gesture, 'Unknown')}"
-    cv.putText(color, gesture_text, (10, 70), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    # Display detection mode
+    mode_text = f"Mode: {detection_mode.upper()}"
+    cv.putText(color, mode_text, (10, 70), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    
+    # Display current gesture (only in hand mode)
+    if detection_mode == "hand" or detection_mode == "both":
+        gesture_names = {-1: "No Hand", 0: "Fist", 1: "Thumb Up", 2: "Peace", 3: "Three", 4: "Four", 5: "Open Hand"}
+        gesture_text = f"Gesture: {gesture_names.get(stable_gesture, 'Unknown')}"
+        cv.putText(color, gesture_text, (10, 110), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     
     cv.imshow("CUSTOM CAMERA", color)
 

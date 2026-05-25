@@ -1,0 +1,14 @@
+{
+  "example_user_1": {
+    "smile": "https://via.placeholder.com/400x300?text=Smile+Detected",
+    "blink": "https://via.placeholder.com/400x300?text=Blink+Detected",
+    "mouth_open": "https://via.placeholder.com/400x300?text=Mouth+Open",
+    "eyebrows_raised": "https://via.placeholder.com/400x300?text=Eyebrows+Raised"
+  },
+  "example_user_2": {
+    "smile": "https://via.placeholder.com/400x300?text=User2+Smile",
+    "blink": "https://via.placeholder.com/400x300?text=User2+Blink",
+    "mouth_open": "https://via.placeholder.com/400x300?text=User2+Mouth",
+    "eyebrows_raised": "https://via.placeholder.com/400x300?text=User2+Brows"
+  }
+}
