@@ -66,17 +66,6 @@ gesture_history = []
 stable_gesture = -1
 gesture_stability_frames = 5  # Require 5 consistent frames for stable gesture
 
-# Initialize face detection components
-expression_detector = ExpressionDetector(stability_frames=5)
-face_database = FaceDatabase("face_database.pkl")
-image_manager = ImageWindowManager("image_cache", timeout=5)
-
-# Load expression-to-URL config
-face_config = {}
-if os.path.exists("face_config.json"):
-    with open("face_config.json", "r") as f:
-        face_config = json.load(f)
-
 # Detection mode variables
 detection_mode = "hand"  # hand, face, or both
 detected_faces = {}  # Store detected face info per frame
@@ -519,6 +508,17 @@ class ImageWindowManager:
             del self.window_timers[window_name]
             if window_name in self.open_windows:
                 del self.open_windows[window_name]
+
+# Initialize face detection components (must be after class definitions)
+expression_detector = ExpressionDetector(stability_frames=5)
+face_database = FaceDatabase("face_database.pkl")
+image_manager = ImageWindowManager("image_cache", timeout=5)
+
+# Load expression-to-URL config
+face_config = {}
+if os.path.exists("face_config.json"):
+    with open("face_config.json", "r") as f:
+        face_config = json.load(f)
 
 def update_stable_gesture(new_gesture, gesture_history, stable_gesture, stability_frames=5):
     """Update gesture only when stable across multiple frames"""
